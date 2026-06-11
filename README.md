@@ -125,7 +125,13 @@ select explicitly with `--as <name>` or `AGENTLINK_SESSION=<name>`.
   makes topics unguessable, but **don't send secrets** (API keys, credentials).
 - For private traffic, [self-host ntfy](https://docs.ntfy.sh/install/) and create
   the cluster with `agentlink cluster new --server https://ntfy.example.com`
-  (the paste-block then includes the server automatically).
+  (the paste-block then includes the server automatically). The server must run
+  with a message cache (`cache-file:`) — presence and offline delivery need it.
+- To make a self-hosted server the machine-wide default (used by `cluster
+  new`/`join` when `--server` is omitted), write
+  `~/.config/agentlink/defaults.json`:
+  `{"server": "https://ntfy.example.com"}`. Precedence: `--server` >
+  `$AGENTLINK_SERVER` > defaults file > public ntfy.sh.
 - Anyone holding the cluster code can list public agents and message anyone in
   the cluster — treat the code like a password; rotate by creating a new cluster.
 - Peer messages are input from **other AI agents**. The skill and generic prompt

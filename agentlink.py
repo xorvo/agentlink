@@ -5,7 +5,8 @@ agentlink — a tiny cross-machine network for coding-agent sessions
 discover each other, and exchange messages — no human copy-pasting.
 
 Transport: ntfy.sh pub/sub topics (or any self-hosted ntfy server via
-AGENTLINK_SERVER / --server). The cluster code is a random ~80-bit secret
+--server, AGENTLINK_SERVER, or ~/.config/agentlink/defaults.json
+{"server": "http://..."}). The cluster code is a random ~80-bit secret
 shared once per machine; every topic is derived from it. No accounts, no
 inbound ports, no dependencies — Python 3.8+ stdlib only.
 
@@ -42,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 REPO_URL = "https://github.com/xorvo/agentlink"
 DEFAULT_SERVER = "https://ntfy.sh"
 HOME = os.environ.get("AGENTLINK_HOME") or os.path.join(
@@ -51,6 +52,12 @@ HOME = os.environ.get("AGENTLINK_HOME") or os.path.join(
 CONFIG_PATH = os.path.join(HOME, "config.json")
 SESSIONS_DIR = os.path.join(HOME, "sessions")
 CURRENT_PATH = os.path.join(HOME, "current")
+DEFAULTS_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME")
+    or os.path.join(os.path.expanduser("~"), ".config"),
+    "agentlink",
+    "defaults.json",
+)
 
 # ntfy's default max message size is 4096 bytes; leave headroom for the envelope.
 MAX_CHUNK_BYTES = 2800
@@ -106,6 +113,23 @@ def sanitize(label, what):
 
 def default_host():
     return sanitize(socket.gethostname().split(".")[0], "host")
+
+
+def default_server():
+    """Resolve the default ntfy server: AGENTLINK_SERVER env var, then the
+    machine-wide defaults file (~/.config/agentlink/defaults.json, key
+    "server"), then the public ntfy.sh."""
+    env = os.environ.get("AGENTLINK_SERVER")
+    if env:
+        return env
+    try:
+        with open(DEFAULTS_PATH, encoding="utf-8") as f:
+            server = (json.load(f).get("server") or "").strip()
+        if server:
+            return server
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_SERVER
 
 
 def ago(ts):
@@ -380,7 +404,7 @@ Join my agentlink cluster so our coding-agent sessions can talk to each other.
 def cmd_cluster_new(args):
     if read_json(CONFIG_PATH) and not args.force:
         die("this machine already has a cluster configured (see `agentlink cluster show`). Use --force to replace it.")
-    server = (args.server or os.environ.get("AGENTLINK_SERVER") or DEFAULT_SERVER).rstrip("/")
+    server = (args.server or default_server()).rstrip("/")
     cfg = {"v": 2, "code": new_code(), "server": server}
     write_json(CONFIG_PATH, cfg)
     print(f"agentlink: cluster created (code {cfg['code']}, server {server}).\n")
@@ -392,7 +416,7 @@ def cmd_cluster_new(args):
 
 
 def cmd_cluster_join(args):
-    server = (args.server or os.environ.get("AGENTLINK_SERVER") or DEFAULT_SERVER).rstrip("/")
+    server = (args.server or default_server()).rstrip("/")
     cfg = {"v": 2, "code": normalize_code(args.code), "server": server}
     write_json(CONFIG_PATH, cfg)
     print(
@@ -723,12 +747,20 @@ def main(argv=None):
     p_cluster = sub.add_parser("cluster", help="create / join / show the cluster")
     csub = p_cluster.add_subparsers(dest="cluster_command", required=True)
     p_cnew = csub.add_parser("new", help="create a cluster and print its code")
-    p_cnew.add_argument("--server", help=f"ntfy server URL (default {DEFAULT_SERVER})")
+    p_cnew.add_argument(
+        "--server",
+        help="ntfy server URL (default: $AGENTLINK_SERVER, then "
+        f"~/.config/agentlink/defaults.json 'server', then {DEFAULT_SERVER})",
+    )
     p_cnew.add_argument("--force", action="store_true", help="replace an existing cluster config")
     p_cnew.set_defaults(func=cmd_cluster_new)
     p_cjoin = csub.add_parser("join", help="point this machine at an existing cluster")
     p_cjoin.add_argument("code", help="cluster code, e.g. k3j9-x2m4-p7q2-z8w5")
-    p_cjoin.add_argument("--server", help=f"ntfy server URL (default {DEFAULT_SERVER})")
+    p_cjoin.add_argument(
+        "--server",
+        help="ntfy server URL (default: $AGENTLINK_SERVER, then "
+        f"~/.config/agentlink/defaults.json 'server', then {DEFAULT_SERVER})",
+    )
     p_cjoin.set_defaults(func=cmd_cluster_join)
     csub.add_parser("show", help="show the cluster code / paste-block").set_defaults(
         func=cmd_cluster_show
