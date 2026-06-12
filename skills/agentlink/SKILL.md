@@ -38,6 +38,9 @@ sessions (`up --private`) are reachable only by their exact full address.
   When it exits with an event, handle it, then start `agentlink recv` again so
   the next event wakes you. Do not poll. For a quick foreground wait, use
   `agentlink recv --timeout 120` (exit code 2 = nothing arrived).
+  Exit code 3 = the server was unreachable for many consecutive attempts —
+  check whether the server moved (ask your user if unsure), then rejoin with
+  `agentlink cluster join <code> --server <url>` and restart `recv`.
 - **Direct connection:** `agentlink connect <who>` sends a request; the peer's
   recv surfaces it and they confirm with `agentlink accept <you>`. If your recv
   prints a connect request, relay it to your user before accepting.

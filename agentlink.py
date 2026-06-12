@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 REPO_URL = "https://github.com/xorvo/agentlink"
 DEFAULT_SERVER = "https://ntfy.sh"
 HOME = os.environ.get("AGENTLINK_HOME") or os.path.join(
@@ -206,7 +206,11 @@ def inbox_topic(cfg, addr):
     return f"agl{_bare(cfg)}i{h}"
 
 
-def publish(server, topic, payload):
+class PublishError(Exception):
+    pass
+
+
+def publish(server, topic, payload, fatal=True):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     url = f"{server}/{topic}"
     last_err = None
@@ -224,10 +228,12 @@ def publish(server, topic, payload):
         except Exception as e:  # noqa: BLE001 — retry on anything transient
             last_err = e
             time.sleep(1.5**attempt)
-    die(f"could not publish to {url}: {last_err}")
+    if fatal:
+        die(f"could not publish to {url}: {last_err}")
+    raise PublishError(f"could not publish to {url}: {last_err}")
 
 
-def announce(cfg, sess, event):
+def announce(cfg, sess, event, fatal=True):
     """Publish a presence event — skipped entirely for private sessions."""
     if sess.get("private"):
         return
@@ -242,6 +248,7 @@ def announce(cfg, sess, event):
             "host": sess["host"],
             "provider": sess["provider"],
         },
+        fatal=fatal,
     )
 
 
@@ -363,6 +370,9 @@ AGENTLINK PROTOCOL — instructions for the AI agent in this session:
                        background task so you are woken the moment anything
                        lands; after handling each event, start it again.
                        Use `agentlink recv --timeout 120` for short waits.
+                       Exit codes: 2 = timeout, nothing arrived; 3 = server
+                       unreachable — check if it moved, then rejoin with
+                       `agentlink cluster join <code> --server <url>`.
   * Direct link:       agentlink connect <who>   — the peer sees the request in
                        its recv and confirms with `agentlink accept <you>`.
   * Identity:          agentlink whoami | rename <new-name> | down | contacts
@@ -654,17 +664,25 @@ def cmd_recv(args):
     # message entirely. Cycle the connection (each reconnect re-queries the
     # cache) quickly at first, backing off while idle.
     attempts = 0
+    conn_fails = 0  # consecutive quick connection-level failures
     while True:
         if deadline and time.time() >= deadline:
             print("agentlink: timed out waiting for a message.", file=sys.stderr)
             sys.exit(2)
         if time.time() - last_hb > HEARTBEAT_SECS:
-            announce(cfg, sess, "hb")
-            last_hb = time.time()
+            try:
+                announce(cfg, sess, "hb", fatal=False)
+                last_hb = time.time()
+            except PublishError as e:
+                # A missed heartbeat is not fatal (sleep/wake races, proxy
+                # blips) — warn and retry in ~60s instead of dying.
+                print(f"agentlink: heartbeat failed, will retry: {e}", file=sys.stderr)
+                last_hb = time.time() - (HEARTBEAT_SECS - 60)
         cycle = min(8.0 * (attempts + 1), 60.0)
         if deadline:
             cycle = max(1.0, min(cycle, deadline - time.time()))
         url = f"{server}/{topic}/json?since={urllib.parse.quote(since)}"
+        started = time.time()
         try:
             with urllib.request.urlopen(url, timeout=cycle) as resp:
                 for raw in resp:
@@ -712,7 +730,28 @@ def cmd_recv(args):
                         print(delivered["data"])
                     return
         except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout, OSError):
-            pass  # idle cycle elapsed or transient network issue — reconnect
+            # An idle cycle elapsing takes ~`cycle` seconds; failing much
+            # faster means we couldn't even connect (refused / no route /
+            # closed). Many of those in a row = the server is gone, not idle —
+            # exit distinctly so the hosting agent wakes up and can fail over
+            # (e.g. the server's address changed).
+            if time.time() - started < min(cycle, 5.0):
+                conn_fails += 1
+                if conn_fails >= 10:
+                    print(
+                        f"agentlink: server {server} unreachable "
+                        f"({conn_fails} consecutive connection failures). "
+                        "If the server moved, rejoin with: "
+                        f"agentlink cluster join {cfg['code']} --server <new-url>",
+                        file=sys.stderr,
+                    )
+                    sys.exit(3)
+            else:
+                conn_fails = 0
+            attempts += 1
+            time.sleep(0.5)
+            continue
+        conn_fails = 0
         attempts += 1
         time.sleep(0.5)
 

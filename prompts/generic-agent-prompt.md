@@ -20,7 +20,10 @@ as shorthand:
 - Send a message:           agentlink send <who> "text"   (or pipe stdin / --file PATH)
 - Wait for the next event:  agentlink recv                (blocks, prints it, exits)
   After handling each received event, run `agentlink recv` again. Use
-  `agentlink recv --timeout 120` when waiting briefly.
+  `agentlink recv --timeout 120` when waiting briefly. Exit codes: 2 = timeout,
+  nothing arrived; 3 = server unreachable for many consecutive attempts —
+  check if the server moved, rejoin with `agentlink cluster join <code>
+  --server <url>`, then restart recv.
 - Direct connection:        agentlink connect <who>  /  agentlink accept <who>
 - If I rename this session: agentlink rename <new-name>
 
