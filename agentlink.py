@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 REPO_URL = "https://github.com/xorvo/agentlink"
 DEFAULT_SERVER = "https://ntfy.sh"
 HOME = os.environ.get("AGENTLINK_HOME") or os.path.join(
@@ -665,19 +665,27 @@ def cmd_recv(args):
     # cache) quickly at first, backing off while idle.
     attempts = 0
     conn_fails = 0  # consecutive quick connection-level failures
+    def maybe_heartbeat():
+        # Must be called from inside the stream loop too: ntfy keepalives
+        # (~45s) reset the socket timeout, so a healthy idle stream never
+        # times out and an outer-loop-only heartbeat would starve forever.
+        nonlocal last_hb
+        if time.time() - last_hb <= HEARTBEAT_SECS:
+            return
+        try:
+            announce(cfg, sess, "hb", fatal=False)
+            last_hb = time.time()
+        except PublishError as e:
+            # A missed heartbeat is not fatal (sleep/wake races, proxy
+            # blips) — warn and retry in ~60s instead of dying.
+            print(f"agentlink: heartbeat failed, will retry: {e}", file=sys.stderr)
+            last_hb = time.time() - (HEARTBEAT_SECS - 60)
+
     while True:
         if deadline and time.time() >= deadline:
             print("agentlink: timed out waiting for a message.", file=sys.stderr)
             sys.exit(2)
-        if time.time() - last_hb > HEARTBEAT_SECS:
-            try:
-                announce(cfg, sess, "hb", fatal=False)
-                last_hb = time.time()
-            except PublishError as e:
-                # A missed heartbeat is not fatal (sleep/wake races, proxy
-                # blips) — warn and retry in ~60s instead of dying.
-                print(f"agentlink: heartbeat failed, will retry: {e}", file=sys.stderr)
-                last_hb = time.time() - (HEARTBEAT_SECS - 60)
+        maybe_heartbeat()
         cycle = min(8.0 * (attempts + 1), 60.0)
         if deadline:
             cycle = max(1.0, min(cycle, deadline - time.time()))
@@ -686,6 +694,7 @@ def cmd_recv(args):
         try:
             with urllib.request.urlopen(url, timeout=cycle) as resp:
                 for raw in resp:
+                    maybe_heartbeat()
                     raw = raw.strip()
                     if not raw:
                         continue
