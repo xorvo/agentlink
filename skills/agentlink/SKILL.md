@@ -34,6 +34,10 @@ sessions (`up --private`) are reachable only by their exact full address.
 - **Who's around:** `agentlink list`
 - **Send:** `agentlink send <who> "text"` — `<who>` is a name like `builder` or a
   full address. Multiline text or code: pipe stdin or use `--file PATH`.
+- **Send a file:** `agentlink send <who> --attach PATH` — any file, binary-safe
+  (compressed + encrypted). The peer's `recv` saves it to `~/.agentlink/inbox/`
+  and prints the path. Use this for images/binaries; plain `--file` reads as
+  UTF-8 text and corrupts non-text.
 - **Receive:** keep one `agentlink recv` running in the background at all times.
   When it exits with an event, handle it, then start `agentlink recv` again so
   the next event wakes you. Do not poll. For a quick foreground wait, use

@@ -23,7 +23,8 @@ Commands:
   agentlink cluster show           reprint the code / paste-block
   agentlink up --name N            register this session and go online
   agentlink list                   public agents in the cluster
-  agentlink send <who> <text...>   message an agent (--file PATH, or stdin)
+  agentlink send <who> <text...>   message an agent (--file TEXT, or stdin)
+  agentlink send <who> --attach F  send any file (compressed + encrypted)
   agentlink recv [--timeout N]     block until something arrives, print, exit
   agentlink connect <who>          request a direct connection (peer accepts)
   agentlink accept <who>           accept a pending connect request
@@ -31,7 +32,9 @@ Commands:
 """
 
 import argparse
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -42,8 +45,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 REPO_URL = "https://github.com/xorvo/agentlink"
 DEFAULT_SERVER = "https://ntfy.sh"
 HOME = os.environ.get("AGENTLINK_HOME") or os.path.join(
@@ -214,7 +218,7 @@ def publish(server, topic, payload, fatal=True):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     url = f"{server}/{topic}"
     last_err = None
-    for attempt in range(4):
+    for attempt in range(6):
         try:
             req = urllib.request.Request(
                 url,
@@ -225,6 +229,16 @@ def publish(server, topic, payload, fatal=True):
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp.read()
             return
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 429:  # rate limited — wait longer (honor Retry-After)
+                try:
+                    wait = float(e.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    wait = 2.0 * (attempt + 1)
+                time.sleep(min(wait, 30.0))
+            else:
+                time.sleep(1.5**attempt)
         except Exception as e:  # noqa: BLE001 — retry on anything transient
             last_err = e
             time.sleep(1.5**attempt)
@@ -309,6 +323,84 @@ def remember_contact(sess, addr, **fields):
     save_session(sess)
 
 
+# ----------------------------------------------------- file transfer crypto
+#
+# agentlink ships as one dependency-free file, and the Python stdlib has no
+# block cipher — so file payloads are protected with an authenticated cipher
+# built only from HMAC-SHA256 (a vetted primitive), in the standard
+# encrypt-then-MAC arrangement:
+#   keys   = PBKDF2-HMAC-SHA256(cluster_code) -> (k_enc, k_mac)
+#   stream = HMAC(k_enc, nonce || counter) blocks, XORed into the plaintext
+#   tag    = HMAC(k_mac, nonce || ciphertext), verified in constant time
+# The cluster code is the shared secret, so anyone in the cluster can decrypt
+# and no one else (including the ntfy relay) can read or tamper undetected.
+# If you later add the `cryptography` dep, swap _encrypt/_decrypt for AES-GCM;
+# the wire format already carries an algorithm tag for exactly this.
+
+FILE_ENC = "hmac-sha256-ctr-v1"
+FILE_KDF_SALT = b"agentlink-file-kdf-v1"
+FILE_KDF_ROUNDS = 200_000
+MAX_FILE_BYTES = 10 * 1024 * 1024  # refuse larger; transport is many small POSTs
+
+
+def _file_keys(cfg):
+    master = hashlib.pbkdf2_hmac(
+        "sha256", cfg["code"].encode("utf-8"), FILE_KDF_SALT, FILE_KDF_ROUNDS, dklen=64
+    )
+    return master[:32], master[32:]
+
+
+def _keystream(k_enc, nonce, n):
+    out = bytearray()
+    counter = 0
+    while len(out) < n:
+        out += hmac.new(k_enc, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest()
+        counter += 1
+    return bytes(out[:n])
+
+
+def _encrypt(plaintext, k_enc, k_mac):
+    nonce = secrets.token_bytes(16)
+    ks = _keystream(k_enc, nonce, len(plaintext))
+    ciphertext = bytes(a ^ b for a, b in zip(plaintext, ks))
+    tag = hmac.new(k_mac, nonce + ciphertext, hashlib.sha256).digest()
+    return nonce, ciphertext, tag
+
+
+def _decrypt(nonce, ciphertext, tag, k_enc, k_mac):
+    expected = hmac.new(k_mac, nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, tag):
+        raise ValueError("authentication failed (wrong cluster or tampered data)")
+    ks = _keystream(k_enc, nonce, len(ciphertext))
+    return bytes(a ^ b for a, b in zip(ciphertext, ks))
+
+
+def _b85(raw):
+    return base64.b85encode(raw).decode("ascii")
+
+
+def _unb85(text):
+    return base64.b85decode(text.encode("ascii"))
+
+
+def save_inbox_file(sender, name, data):
+    """Write a received file under ~/.agentlink/inbox/<sender-host>/, never
+    clobbering: foo.png, foo (1).png, ... Returns the absolute path."""
+    host = sanitize(sender.split(":")[0], "host") if sender and ":" in sender else "unknown"
+    dest_dir = os.path.join(HOME, "inbox", host)
+    os.makedirs(dest_dir, exist_ok=True)
+    base = os.path.basename(name) or "received.bin"
+    stem, ext = os.path.splitext(base)
+    path = os.path.join(dest_dir, base)
+    n = 1
+    while os.path.exists(path):
+        path = os.path.join(dest_dir, f"{stem} ({n}){ext}")
+        n += 1
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
 # --------------------------------------------------------------- messaging
 
 def split_utf8(text, max_bytes):
@@ -325,7 +417,28 @@ def split_utf8(text, max_bytes):
     return chunks
 
 
-def _handle_event(ev, partial):
+def _reassemble_file(rec, cfg):
+    """Decode -> verify+decrypt -> decompress -> integrity-check a complete
+    file. Returns a delivered dict (type 'file' or 'file-error')."""
+    sender = rec.get("from", "(unknown)")
+    name = os.path.basename(rec.get("name") or "received.bin") or "received.bin"
+    try:
+        payload = "".join(rec["got"][i] for i in range(1, rec["total"] + 1))
+        packed = _unb85(payload)
+        if rec.get("enc"):
+            if rec["enc"] != FILE_ENC:
+                raise ValueError(f"unknown encryption '{rec['enc']}'")
+            k_enc, k_mac = _file_keys(cfg)
+            packed = _decrypt(_unb85(rec["nonce"]), packed, _unb85(rec["tag"]), k_enc, k_mac)
+        raw = zlib.decompress(packed) if rec.get("comp") == "zlib" else packed
+        if rec.get("sha256") and hashlib.sha256(raw).hexdigest() != rec["sha256"]:
+            raise ValueError("sha256 mismatch")
+    except Exception as e:  # noqa: BLE001 — any decode/auth/decompress failure
+        return {"type": "file-error", "from": sender, "name": name, "error": str(e)}
+    return {"type": "file", "from": sender, "name": name, "bytes": raw}
+
+
+def _handle_event(ev, partial, cfg=None):
     """Process one ntfy event from my inbox. Returns a delivered dict or None."""
     body = ev.get("message", "")
     try:
@@ -344,18 +457,25 @@ def _handle_event(ev, partial):
             "host": env.get("host", ""),
             "provider": env.get("provider", ""),
         }
-    if t != "msg":
+    if t not in ("msg", "file"):
         return None
 
     sender = env.get("from", "(unknown)")
     key = (sender, str(env.get("id") or "noid"))
     total = max(1, int(env.get("total", 1)))
-    rec = partial.setdefault(key, {"total": total, "got": {}, "name": env.get("name")})
+    rec = partial.setdefault(key, {"total": total, "got": {}, "from": sender})
     rec["got"][int(env.get("part", 1))] = env.get("data", "")
-    if len(rec["got"]) == rec["total"]:
-        data = "".join(rec["got"][i] for i in range(1, rec["total"] + 1))
-        return {"type": "msg", "from": sender, "data": data, "name": rec.get("name")}
-    return None
+    # File metadata rides on every part; capture it whenever present.
+    for k in ("name", "size", "sha256", "enc", "comp", "nonce", "tag"):
+        if k in env:
+            rec[k] = env[k]
+    rec["kind"] = t
+    if len(rec["got"]) != rec["total"]:
+        return None
+    if rec.get("kind") == "file":
+        return _reassemble_file(rec, cfg)
+    data = "".join(rec["got"][i] for i in range(1, rec["total"] + 1))
+    return {"type": "msg", "from": sender, "data": data, "name": rec.get("name")}
 
 
 PROTOCOL = """\
@@ -365,6 +485,10 @@ AGENTLINK PROTOCOL — instructions for the AI agent in this session:
                        <who> = full host:provider:name, or any unique suffix
                        (just the name usually works). Multiline text or code:
                        pipe stdin (`cat f | agentlink send <who>`) or --file PATH.
+  * Send a file:       agentlink send <who> --attach PATH   (any file, binary-
+                       safe: compressed + encrypted; receiver's recv saves it to
+                       ~/.agentlink/inbox/ and prints the path). Use this for
+                       images/binaries — plain --file mangles non-text.
   * Wait for events:   agentlink recv      (blocks until something arrives,
                        prints it, exits). Keep one `agentlink recv` running as a
                        background task so you are woken the moment anything
@@ -558,10 +682,70 @@ def cmd_contacts(args):
             print(f"  {addr}")
 
 
+def cmd_send_file(args, cfg, sess, target):
+    """Send a binary file: compress (if it helps) -> encrypt -> base85 ->
+    chunk. The receiver reverses it and writes the file to its inbox."""
+    path = args.attach
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        die(f"cannot read {path}: {e}")
+    if not raw:
+        die("refusing to send an empty file.")
+    if len(raw) > MAX_FILE_BYTES:
+        die(
+            f"{path} is {len(raw)} bytes (limit {MAX_FILE_BYTES}). "
+            "Transport is many small messages; share very large files another way."
+        )
+
+    digest = hashlib.sha256(raw).hexdigest()
+    packed = zlib.compress(raw, 9)
+    comp = "zlib"
+    if len(packed) >= len(raw):  # already-compressed data (jpg/png/zip) — don't bloat
+        packed, comp = raw, None
+
+    k_enc, k_mac = _file_keys(cfg)
+    nonce, ciphertext, tag = _encrypt(packed, k_enc, k_mac)
+    payload = _b85(ciphertext)
+    chunks = [payload[i : i + MAX_CHUNK_BYTES] for i in range(0, len(payload), MAX_CHUNK_BYTES)] or [""]
+
+    msg_id = secrets.token_hex(4)
+    topic = inbox_topic(cfg, target)
+    meta = {
+        "name": os.path.basename(path),
+        "size": len(raw),
+        "sha256": digest,
+        "enc": FILE_ENC,
+        "comp": comp,
+        "nonce": _b85(nonce),
+        "tag": _b85(tag),
+    }
+    if len(chunks) > 100:
+        print(f"agentlink: sending {len(raw)} bytes as {len(chunks)} parts — this may take a moment...")
+    for i, chunk in enumerate(chunks, 1):
+        envelope = {
+            "v": 2, "type": "file", "id": msg_id,
+            "part": i, "total": len(chunks),
+            "from": sess["addr"], "data": chunk, **meta,
+        }
+        publish(cfg["server"], topic, envelope)
+        if len(chunks) > 1:
+            time.sleep(0.02)  # pace multi-part sends so we don't trip rate limits
+    remember_contact(sess, target)
+    enc_note = "encrypted" + (", compressed" if comp else "")
+    print(
+        f"agentlink: sent file {meta['name']} ({len(raw)} bytes, {enc_note}) "
+        f"in {len(chunks)} part(s) to {target} (id {msg_id})."
+    )
+
+
 def cmd_send(args):
     cfg = load_config()
     sess = load_session(args)
     target = resolve_target(cfg, sess, args.target)
+    if getattr(args, "attach", None):
+        return cmd_send_file(args, cfg, sess, target)
     if args.file:
         try:
             with open(args.file, encoding="utf-8", errors="replace") as f:
@@ -707,7 +891,7 @@ def cmd_recv(args):
                             break
                         continue
                     since = ev.get("id") or since
-                    delivered = _handle_event(ev, partial)
+                    delivered = _handle_event(ev, partial, cfg)
                     if delivered is None:
                         continue
                     sess["cursor"] = since
@@ -729,6 +913,20 @@ def cmd_recv(args):
                         print(
                             f"[agentlink] {sender} accepted your connection request — "
                             f"message them with `agentlink send {sender} ...`."
+                        )
+                    elif delivered["type"] == "file":
+                        remember_contact(sess, sender)
+                        out = save_inbox_file(sender, delivered["name"], delivered["bytes"])
+                        print(
+                            f"[agentlink] file from {sender}: {delivered['name']} "
+                            f"({len(delivered['bytes'])} bytes, verified) -> {out}"
+                        )
+                    elif delivered["type"] == "file-error":
+                        remember_contact(sess, sender)
+                        print(
+                            f"[agentlink] file from {sender} ({delivered['name']}) "
+                            f"FAILED: {delivered['error']} — discarded.",
+                            file=sys.stderr,
                         )
                     else:
                         remember_contact(sess, sender)
@@ -839,7 +1037,12 @@ def main(argv=None):
     p_send = sub.add_parser("send", help="send a message to an agent")
     p_send.add_argument("target", help="full host:provider:name, or a unique suffix (e.g. the name)")
     p_send.add_argument("text", nargs="*", help="message text (omit to read stdin)")
-    p_send.add_argument("--file", help="send the contents of a file")
+    p_send.add_argument("--file", help="send a TEXT file's contents as a message (UTF-8)")
+    p_send.add_argument(
+        "--attach",
+        help="send any file binary-safe (compressed + encrypted); the receiver "
+        "saves it to ~/.agentlink/inbox/ and prints the path",
+    )
     add_as(p_send)
     p_send.set_defaults(func=cmd_send)
 
