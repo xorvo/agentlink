@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 import zlib
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 REPO_URL = "https://github.com/xorvo/agentlink"
 DEFAULT_SERVER = "https://ntfy.sh"
 HOME = os.environ.get("AGENTLINK_HOME") or os.path.join(
@@ -55,7 +55,17 @@ HOME = os.environ.get("AGENTLINK_HOME") or os.path.join(
 )
 CONFIG_PATH = os.path.join(HOME, "config.json")
 SESSIONS_DIR = os.path.join(HOME, "sessions")
-CURRENT_PATH = os.path.join(HOME, "current")
+CURRENT_PATH = os.path.join(HOME, "current")  # legacy shared pointer (no scope)
+# Env vars that uniquely identify a shell/agent session, most-specific first.
+# Used to scope the default identity so concurrent sessions on one machine
+# don't clobber each other's `current`. AGENTLINK_SCOPE is an explicit override.
+SCOPE_VARS = (
+    "AGENTLINK_SCOPE",
+    "CLAUDE_CODE_SESSION_ID",
+    "TERM_SESSION_ID",
+    "TMUX_PANE",
+    "STARSHIP_SESSION_KEY",
+)
 DEFAULTS_PATH = os.path.join(
     os.environ.get("XDG_CONFIG_HOME")
     or os.path.join(os.path.expanduser("~"), ".config"),
@@ -159,12 +169,37 @@ def load_config(required=True):
     return cfg
 
 
+def session_scope():
+    """A key stable within one shell/agent session but distinct between
+    concurrent sessions on the same machine, so each keeps its own default
+    identity. Returns None when nothing identifies the session (then the single
+    legacy `current` file is used — the old shared behavior)."""
+    for var in SCOPE_VARS:
+        v = os.environ.get(var)
+        if v:
+            return f"{var}:{v}"
+    try:
+        return "tty:" + os.ttyname(0)
+    except OSError:
+        return None
+
+
+def current_path():
+    """Path to this session's default-identity pointer. Per-scope when the
+    session is identifiable; otherwise the legacy shared file."""
+    scope = session_scope()
+    if scope:
+        h = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(HOME, "current.d", h)
+    return CURRENT_PATH
+
+
 def current_session_name(args):
     name = getattr(args, "as_", None) or os.environ.get("AGENTLINK_SESSION")
     if name:
         return sanitize(name, "session name")
     try:
-        with open(CURRENT_PATH, encoding="utf-8") as f:
+        with open(current_path(), encoding="utf-8") as f:
             return f.read().strip()
     except FileNotFoundError:
         return None
@@ -190,8 +225,9 @@ def save_session(sess):
 
 
 def set_current(name):
-    os.makedirs(HOME, exist_ok=True)
-    with open(CURRENT_PATH, "w", encoding="utf-8") as f:
+    path = current_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         f.write(name)
 
 
@@ -605,7 +641,7 @@ def cmd_down(args):
     sess = load_session(args)
     announce(cfg, sess, "down")
     try:
-        os.remove(CURRENT_PATH)
+        os.remove(current_path())
     except FileNotFoundError:
         pass
     print(f"agentlink: {sess['addr']} is offline (contacts and history kept; `agentlink up` to return).")
@@ -662,6 +698,10 @@ def cmd_whoami(args):
     print(f"cluster:    {cfg['code']} ({cfg['server']})")
     print(f"inbox:      {cfg['server']}/{inbox_topic(cfg, sess['addr'])}")
     print(f"state:      {session_path(sess['name'])}")
+    if not (getattr(args, "as_", None) or os.environ.get("AGENTLINK_SESSION")):
+        scope = session_scope()
+        which = scope.split(":", 1)[0] if scope else "none"
+        print(f"scope:      {'per-session via ' + which if scope else 'shared global (no session id found)'}")
 
 
 def cmd_contacts(args):
@@ -978,7 +1018,8 @@ def cmd_reset(_args):
 def add_as(parser):
     parser.add_argument(
         "--as", dest="as_", metavar="NAME",
-        help="act as this registered session (default: the last `up`; or set AGENTLINK_SESSION)",
+        help="act as this registered session (default: the last `up` in THIS "
+        "shell/agent session; or set AGENTLINK_SESSION)",
     )
 
 

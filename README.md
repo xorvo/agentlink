@@ -100,8 +100,14 @@ that can run shell commands can follow it — `recv` is just a blocking command.
 | `agentlink whoami` / `contacts` / `down` | Identity, known peers, go offline |
 | `agentlink reset` | Wipe all local state |
 
-Multiple sessions on one machine: the most recent `up` is the default identity;
-select explicitly with `--as <name>` or `AGENTLINK_SESSION=<name>`.
+Multiple sessions on one machine each keep their own default identity: the
+default is the most recent `up` **within the same shell/agent session**, scoped
+automatically by a per-session id (`CLAUDE_CODE_SESSION_ID`, `TERM_SESSION_ID`,
+`TMUX_PANE`, the controlling tty, … — or set `AGENTLINK_SCOPE` explicitly). So a
+second session running `up` no longer hijacks the first session's `whoami`.
+Override per command with `--as <name>` or `AGENTLINK_SESSION=<name>`; when no
+session id is detectable, all commands share one global identity (the old
+behavior). `whoami` prints which scope is in effect.
 
 ## How it works
 
